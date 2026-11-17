@@ -8,7 +8,15 @@ let worker = null, jobId = 0, detector = null, ac = null, dst = null, outUrl = n
 const st = m => { $('st').textContent = m; };
 function setBusy(b) { busy = b; document.querySelectorAll('.act').forEach(e => { e.disabled = b || !file; }); }
 const range = () => [+$('s').value, +$('e').value];
-function seek(t) { return new Promise(r => { const h = () => { v.removeEventListener('seeked', h); r(); }; v.addEventListener('seeked', h); v.currentTime = t; }); }
+function seek(t) {
+  return new Promise((res, rej) => {
+    if (Math.abs(v.currentTime - t) < 0.001) { res(); return; }
+    const clean = () => { v.removeEventListener('seeked', ok); v.removeEventListener('error', bad); clearTimeout(to); };
+    const ok = () => { clean(); res(); }, bad = () => { clean(); rej(new Error('video-error')); };
+    const to = setTimeout(bad, 10000);
+    v.addEventListener('seeked', ok); v.addEventListener('error', bad); v.currentTime = t;
+  });
+}
 async function guard(fn) {
   if (busy) return;
   setBusy(true);
@@ -17,6 +25,7 @@ async function guard(fn) {
 }
 function friendly(err) {
   const m = String((err && err.message) || err);
+  if (/video-error|stalled/.test(m)) return 'Your device could not play this video smoothly. Try a shorter clip, a 720p H.264 MP4, or a computer.';
   if (/memory|allocation|decode/i.test(m)) return 'This video is too large for your browser. Trim it to under about 20 minutes and try again.';
   if (/fetch|network|import|load/i.test(m)) return 'Could not load the AI model. Check your internet connection and try again.';
   return 'Something went wrong: ' + m.slice(0, 140);
@@ -72,7 +81,7 @@ v.onloadedmetadata = () => {
   st(dur > 1500 ? 'This video is long. Captions may fail in the browser, so trim it first if they do.' : 'Ready. Choose your clip below.');
   showFrame();
 };
-v.onerror = () => st('Your browser can’t read that video. Try an MP4.');
+v.onerror = () => { if (!busy) st('Your browser can’t read that video. Try an MP4.'); };
 function sync() {
   let [s, e] = range();
   if (e < s + 1) { e = Math.min(dur, s + 1); $('e').value = e; }
@@ -184,13 +193,22 @@ $('go').onclick = () => guard(async () => {
   v.pause(); await seek(s); paint();
   $('bar').style.display = 'block'; st('Exporting in real time. Keep this tab open and visible.');
   rec.start(500); v.muted = false; await v.play();
-  await new Promise(res => {
-    (function tick() {
-      paint(); $('bi').style.width = Math.min(100, (v.currentTime - s) / (e - s) * 100) + '%';
-      if (v.currentTime >= e || v.ended) { v.pause(); rec.stop(); res(); return; }
-      requestAnimationFrame(tick);
-    })();
-  });
+  try {
+    await new Promise((res, rej) => {
+      let last = -1, lastAt = performance.now();
+      v.addEventListener('error', () => rej(new Error('video-error')), { once: true });
+      (function tick() {
+        paint(); $('bi').style.width = Math.min(100, (v.currentTime - s) / (e - s) * 100) + '%';
+        if (v.currentTime >= e || v.ended) { v.pause(); rec.stop(); res(); return; }
+        if (v.currentTime !== last) { last = v.currentTime; lastAt = performance.now(); }
+        else if (performance.now() - lastAt > 8000) { rej(new Error('stalled')); return; }
+        requestAnimationFrame(tick);
+      })();
+    });
+  } catch (err) {
+    v.pause(); try { if (rec.state !== 'inactive') rec.stop(); } catch (_) {}
+    throw err;
+  }
   await done;
   const ext = mime.includes('mp4') ? 'mp4' : 'webm', blob = new Blob(parts, { type: mime.split(';')[0] });
   if (outUrl) URL.revokeObjectURL(outUrl);

@@ -112,6 +112,46 @@ function spread(chunks, offset) {
   });
   return out;
 }
+// One audio graph shared by captions and export (a video element can only be connected once).
+let srcNode = null;
+function audioGraph() {
+  if (!ac) {
+    const AC = window.AudioContext || window.webkitAudioContext; ac = new AC();
+    srcNode = ac.createMediaElementSource(v); dst = ac.createMediaStreamDestination(); srcNode.connect(dst);
+  }
+  return ac;
+}
+// Listens to only the chosen clip in real time. Uses very little memory, so it works on phones and long videos.
+async function captureAudio(s, e) {
+  const a = audioGraph(); await a.resume();
+  const sp = a.createScriptProcessor(4096, 2, 1), parts = [];
+  sp.onaudioprocess = ev => {
+    const L = ev.inputBuffer.getChannelData(0), R = ev.inputBuffer.numberOfChannels > 1 ? ev.inputBuffer.getChannelData(1) : L, m = new Float32Array(L.length);
+    for (let i = 0; i < L.length; i++) m[i] = (L[i] + R[i]) / 2;
+    parts.push(m);
+  };
+  srcNode.connect(sp); sp.connect(a.destination);
+  const stop = () => { try { srcNode.disconnect(sp); sp.disconnect(); } catch (_) { /* already gone */ } sp.onaudioprocess = null; };
+  try {
+    v.pause(); await seek(s); v.muted = false; await v.play();
+    $('bar').style.display = 'block';
+    await new Promise((res, rej) => {
+      let last = -1, lastAt = performance.now();
+      v.addEventListener('error', () => rej(new Error('video-error')), { once: true });
+      const iv = setInterval(() => {
+        const t = v.currentTime;
+        $('bi').style.width = Math.min(100, (t - s) / (e - s) * 100) + '%'; st('Listening to the clip… ' + Math.round(Math.min(100, (t - s) / (e - s) * 100)) + '%');
+        if (t >= e || v.ended) { clearInterval(iv); res(); return; }
+        if (t !== last) { last = t; lastAt = performance.now(); } else if (performance.now() - lastAt > 8000) { clearInterval(iv); rej(new Error('stalled')); }
+      }, 200);
+    });
+  } finally { v.pause(); stop(); }
+  const n = parts.reduce((t, c) => t + c.length, 0), sr = a.sampleRate;
+  const off = new OfflineAudioContext(1, Math.max(1, Math.ceil(n / sr * 16000)), 16000), buf = off.createBuffer(1, n, sr);
+  let o = 0; const ch = buf.getChannelData(0); parts.forEach(c => { ch.set(c, o); o += c.length; });
+  const src = off.createBufferSource(); src.buffer = buf; src.connect(off.destination); src.start();
+  return (await off.startRendering()).getChannelData(0);
+}
 function asr(chunk, offset) {
   return new Promise((res, rej) => {
     if (!worker) worker = new Worker('./asr-worker.js', { type: 'module' });
@@ -133,13 +173,18 @@ function asr(chunk, offset) {
 function setWords(ws) { words = ws; groups = groupWords(words); paint(); }
 
 $('cap').onclick = () => guard(async () => {
-  const [s, e] = range(), a = await getAudio();
-  const ws = await asr(a.subarray(Math.floor(s * 16000), Math.min(a.length, Math.ceil(e * 16000))), s);
+  const [s, e] = range();
+  const ws = await asr(await captureAudio(s, e), s);
   if (!ws.length) { st('No speech found in this part of the video.'); return; }
   setWords(words.filter(q => q.e <= s || q.s >= e).concat(ws).sort((p, q) => p.s - q.s));
   await seek(s); paint(); st('Captions are ready. Check the preview.');
 });
 $('auto').onclick = () => guard(async () => {
+  const phone = /Android|iPhone|iPad/i.test(navigator.userAgent);
+  if (file.size > (phone ? 60e6 : 300e6) || dur > (phone ? 480 : 1500)) {
+    st(phone ? 'This video is too big to scan on a phone. Pick a clip with the sliders, then tap “Write captions for this clip”.' : 'This video is too big to scan in the browser. Pick a clip with the sliders instead.');
+    return;
+  }
   const a = await getAudio(), ws = await asr(a, 0);
   if (!ws.length) { st('No speech found in this video.'); return; }
   setWords(ws);
@@ -231,11 +276,7 @@ $('go').onclick = () => guard(async () => {
     .find(m => window.MediaRecorder && MediaRecorder.isTypeSupported(m));
   if (!mime) { st('This browser can’t record video. Use a recent Chrome, Edge, Safari or Firefox.'); return; }
   const [s, e] = range();
-  if (!ac) {
-    const AC = window.AudioContext || window.webkitAudioContext; ac = new AC();
-    const src = ac.createMediaElementSource(v); dst = ac.createMediaStreamDestination(); src.connect(dst);
-  }
-  await ac.resume();
+  audioGraph(); await ac.resume();
   const stream = c.captureStream(30); dst.stream.getAudioTracks().forEach(t => stream.addTrack(t));
   const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 5e6 }), parts = [];
   rec.ondataavailable = ev => { if (ev.data.size) parts.push(ev.data); };
@@ -270,3 +311,4 @@ $('go').onclick = () => guard(async () => {
   $('out').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 });
 setBusy(false);
+if (/Android|iPhone|iPad/i.test(navigator.userAgent)) $('model').value = 'Xenova/whisper-tiny';

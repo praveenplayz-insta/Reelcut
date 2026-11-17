@@ -25,10 +25,11 @@ async function guard(fn) {
 }
 function friendly(err) {
   const m = String((err && err.message) || err);
+  const det = ' Details: ' + m.slice(0, 160);
   if (/video-error|stalled/.test(m)) return 'Your device could not play this video smoothly. Try a shorter clip, a 720p H.264 MP4, or a computer.';
-  if (/memory|allocation|decode/i.test(m)) return 'This video is too large for your browser. Trim it to under about 20 minutes and try again.';
-  if (/fetch|network|import|load/i.test(m)) return 'Could not load the AI model. Check your internet connection and try again.';
-  return 'Something went wrong: ' + m.slice(0, 140);
+  if (/memory|allocation|decode/i.test(m)) return 'This video is too large for your browser. Trim it to under about 20 minutes and try again.' + det;
+  if (/fetch|network|import|load/i.test(m)) return 'Could not load the AI model. Check your internet connection and try again.' + det;
+  return 'Something went wrong.' + det;
 }
 
 // ---------- drawing ----------
@@ -102,6 +103,15 @@ async function getAudio() {
   audio = (await off.startRendering()).getChannelData(0);
   return audio;
 }
+// Line-level timing fallback: spread each line's words evenly across its time span.
+function spread(chunks, offset) {
+  const out = [];
+  chunks.forEach(q => {
+    const ws = (q.text || '').trim().split(/\s+/).filter(Boolean), a = offset + q.timestamp[0], b = offset + (q.timestamp[1] ?? q.timestamp[0] + 3);
+    ws.forEach((w, k) => out.push({ w, s: a + (b - a) * k / ws.length, e: a + (b - a) * (k + 1) / ws.length }));
+  });
+  return out;
+}
 function asr(chunk, offset) {
   return new Promise((res, rej) => {
     if (!worker) worker = new Worker('./asr-worker.js', { type: 'module' });
@@ -113,6 +123,7 @@ function asr(chunk, offset) {
       else if (m.type === 'progress') { $('bar').style.display = 'block'; $('bi').style.width = (m.p.progress || 0) + '%'; st('Downloading the caption model (first time only)… ' + Math.round(m.p.progress || 0) + '%'); }
       else if (m.type === 'done') {
         $('bar').style.display = 'none';
+        if (m.seg) { res(spread(m.chunks, offset)); return; }
         res(m.chunks.map(q => ({ w: (q.text || '').trim(), s: offset + q.timestamp[0], e: offset + (q.timestamp[1] ?? q.timestamp[0] + 0.4) })).filter(q => q.w).map(q => ({ ...q, e: Math.max(q.e, q.s + 0.1) })));
       } else if (m.type === 'error') rej(new Error(m.message));
     };
@@ -148,29 +159,68 @@ $('srt').onchange = async e => {
   setWords(ws); st('Captions loaded from your file.');
 };
 
-// ---------- face tracking (MediaPipe) ----------
+// ---------- face tracking (MediaPipe, with backups) ----------
 const MP = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.21';
+let mpError = '';
 async function getDetector() {
   if (detector) return detector;
-  st('Loading face detection…');
   const { FilesetResolver, FaceDetector } = await import(MP + '/vision_bundle.mjs');
   const fs = await FilesetResolver.forVisionTasks(MP + '/wasm');
   detector = await FaceDetector.createFromOptions(fs, {
     baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/face_detector/blaze_face_short_range/float16/1/blaze_face_short_range.tflite' },
-    runningMode: 'IMAGE', minDetectionConfidence: 0.5,
+    runningMode: 'IMAGE', minDetectionConfidence: 0.3,
   });
   return detector;
 }
+// Each detector takes an image source and returns boxes as {x, y, w, h} in that source's pixels.
+async function getDetectors() {
+  const list = [];
+  try {
+    const d = await getDetector();
+    list.push(async src => (d.detect(src).detections || []).map(q => ({ x: q.boundingBox.originX, y: q.boundingBox.originY, w: q.boundingBox.width, h: q.boundingBox.height })));
+  } catch (err) { mpError = String((err && err.message) || err); }
+  if ('FaceDetector' in window) {
+    try {
+      const nd = new window.FaceDetector({ fastMode: true, maxDetectedFaces: 4 });
+      list.push(async src => (await nd.detect(src)).map(q => ({ x: q.boundingBox.x, y: q.boundingBox.y, w: q.boundingBox.width, h: q.boundingBox.height })));
+    } catch (_) { /* not available */ }
+  }
+  return list;
+}
+const crop = document.createElement('canvas');
+// Looks for the biggest face. If the whole frame finds nothing (faces look small in wide shots), tries three zoomed crops.
+async function findFace(dets) {
+  const vw = v.videoWidth, vh = v.videoHeight;
+  for (const det of dets) {
+    let b = [];
+    try { b = await det(v); } catch (_) { /* try next */ }
+    if (b.length) return pick(b, 0, 1);
+    if (vw > vh * 1.2) {
+      const cs = vh, k = cs / Math.min(cs, 640); crop.width = crop.height = Math.min(cs, 640);
+      for (const ox of [(vw - cs) / 2, 0, vw - cs]) {
+        crop.getContext('2d').drawImage(v, ox, 0, cs, cs, 0, 0, crop.width, crop.height);
+        try { b = await det(crop); } catch (_) { b = []; }
+        if (b.length) return pick(b, ox, k);
+      }
+    }
+  }
+  return null;
+}
+const pick = (b, ox, k) => { const q = b.sort((p, r) => r.w * r.h - p.w * p.h)[0]; return ox + (q.x + q.w / 2) * k; };
+
 $('face').onclick = () => guard(async () => {
-  const d = await getDetector(), [s, e] = range(), ts = [], xs = [];
+  st('Loading face detection…');
+  const dets = await getDetectors();
+  if (!dets.length) { st('Face detection could not load on this device. Use the position slider.' + (mpError ? ' Details: ' + mpError.slice(0, 140) : '')); return; }
+  const [s, e] = range(), ts = [], xs = [];
   $('bar').style.display = 'block';
   for (let t = s; t <= e + 1e-6; t += 0.5) {
     await seek(Math.min(t, dur - 0.05));
-    const dets = (d.detect(v).detections || []).map(q => q.boundingBox).sort((p, q) => q.width * q.height - p.width * p.height);
-    if (dets.length) { ts.push(t); xs.push((dets[0].originX + dets[0].width / 2) / v.videoWidth); }
+    const cx = await findFace(dets);
+    if (cx != null) { ts.push(t); xs.push(cx / v.videoWidth); }
     $('bi').style.width = ((t - s) / (e - s) * 100) + '%'; st('Finding the speaker… ' + Math.round((t - s) / (e - s) * 100) + '%');
   }
-  if (!ts.length) { track = null; st('No face found. Use the position slider.'); await seek(s); paint(); return; }
+  if (!ts.length) { track = null; st('No face found in this clip. It may be too small or turned away. Use the position slider.'); await seek(s); paint(); return; }
   track = smooth(ts, xs); await seek(s); paint();
   st(`The crop now follows the speaker (found in ${ts.length} of ${Math.floor((e - s) / 0.5) + 1} samples).`);
 });
